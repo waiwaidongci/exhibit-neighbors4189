@@ -1,3 +1,7 @@
 -- SQLAlchemy metadata initializes tables idempotently.
 -- Domain tables: exhibitions, visitor_ratings, recommendation_runs, curator_selections.
 -- Unique natural keys: source.key; (record.source_id, record.reference).
+-- Relocation drill (迁展演练) tables, also created via Base.metadata.create_all:
+--   drill_jobs      一次演练全过程：封存快照(sha256)、阶段/尝试次数、换号结果、对账、开放时间
+--   drill_ratings   换号评分副本；唯一键 (job_id, anon_id, exhibit) 保证同人同展品限一条
+-- 幂等键 drill_jobs.idempotency_key 唯一；同受理号重试沿封存快照恢复，不新增副本。

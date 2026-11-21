@@ -13,7 +13,8 @@
 3. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
 4. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
 5. 策展备选：分析师草案→负责人批准→阅读者下载批准快照。
-6. 审计：登录、来源修改、任务worker完成、业务说明批准等事件。
+6. 迁展演练：封存原册→换匿名号评分副本→最少原配对复用→对账→整批开放研究选用。
+7. 审计：登录、来源修改、任务worker完成、业务说明批准、演练封存与开放等事件。
 
 ## 快速启动
 
@@ -53,7 +54,7 @@ JWT有效期8小时；PBKDF2盐化哈希保存密码；角色每请求从数据�
 
 ## 实体与字段
 
-Exhibition / VisitorRating / RecommendationRun / CuratorSelection 是核心实体；另有User和Audit。数据库实际表：`exhibitions` → `visitor_ratings` → `recommendation_runs` → `curator_selections`。样本以固定字段JSON保存，后端按以下字段严格验证，不接受未知字段替代必填值：匿名访客（`visitor`）、展品代号（`exhibit`）、评分 1–5（`rating`）。
+Exhibition / VisitorRating / RecommendationRun / CuratorSelection 是核心实体；另有User和Audit。数据库实际表：`exhibitions` → `visitor_ratings` → `recommendation_runs` → `curator_selections`。迁展演练另用 `drill_jobs`（封存快照、换号结果、对账与开放状态）与 `drill_ratings`（换号副本，`(job_id,anon_id,exhibit)` 唯一）。样本以固定字段JSON保存，后端按以下字段严格验证，不接受未知字段替代必填值：匿名访客（`visitor`）、展品代号（`exhibit`）、评分 1–5（`rating`）。
 
 实体贯穿 `backend/src/models`、`schemas`、`services`、`controllers`、`routes`，以及 `frontend/src/api/research.js`、`stores/research.js` 和 `pages`。`Source.key` 与 `(Record.source_id, reference)` 为自然键；来源改名不会修改已冻结任务输入。业务说明在创建时保存结果快照，批准后从该快照导出。
 
@@ -69,6 +70,43 @@ Exhibition / VisitorRating / RecommendationRun / CuratorSelection 是核心实�
 失败态：业务字段缺失/非有限数值、参数越界、样本不足、退化特征或结构错误均明确拒绝或将任务标failed，错误消息保存在任务中。可回到来源或配置修正后重新执行，历史失败记录保留。
 
 已知边界：显式1–5评分，不是隐式行为推荐；按展品代码确定性留一，不能当作时间外推验证。相似度只取正值，至少两个共同评分；回退会显示依据。生产建议在完成评估后用全量已知评分，不将训练评分误报验证。
+
+## 迁展演练（换号评分副本）
+
+迁展演练把原册评分换一套匿名编号，生成可用于研究的评分副本，全部逻辑位于 `backend/src/services/drill_core.py` 与 `services/drills.py`，前端不计算、只发起与核对。
+
+**业务规则与封存语义**
+
+- 受理即封存原册：保存当时已提交评分的不可变快照及 `sha256` 校验和。封存之后的并发补录仍写入活册（`visitor_ratings`），不进入该次快照，因此补录不会污染已受理演练。
+- 换号是原匿名编号上的一个随机置换；副本保留**每人评分条数**与**每件展品各星级人数**，并以唯一键 `(job_id, anon_id, exhibit)` 强制**同人同展品限一条**。
+- 幂等受理：`idempotency_key` 为唯一受理号，同号重复受理返回同一演练，不新增副本。
+- 可恢复执行：记录 `stage`（sealed→matching→copy→reconciled）与 `attempts`。写入中断后按同一受理号沿封存版本重试；重试先清除上一轮未完成副本再整体重写，故同次重试不新增副本、不翻倍。可用环境变量 `DRILL_FAULT=stage` 注入故障演练恢复。
+- 对账通过才开放：七项核对（总条数、每人条数、每展品星级直方图、配对唯一、匿名号为置换、复用数为全局最小、快照完整性）全部通过，状态才置为 `open`，整批开放给研究选用；研究副本接口只返回换号后的 `anon_id/exhibit/rating`，不回显原编号。
+
+**最少原配对复用（不穷举，多项式时间）**
+
+"原配对复用"指副本里某人-展品对与原册是同一对。把原册建模为二分图（人—展品边带星级），令 Z 为"非原边"子图：容量1的 `(人,展品)` 边当且仅当原册不存在该对，再以 `s→人` 容量=该人条数、`展品→t` 容量=该展品评分量，构造带度约束的二分 b-匹配。于是
+
+```text
+最少复用数 min_reused = 总评分条数 N − Z 上最大流 M
+```
+
+实现用最小费用最大流（原边费用1、非原边费用0）一次求出 `min_reused`，并用**独立的 Dinic 最大流**在同一 Z 上重算 M，再由最大流-最小割定理输出最小割容量与割边清单作为可核查的最优性下界证明：任何方案至多安排 M 条非原边，本方案恰好达到该下界，故为全局最优。两套求解器结果必须闭合，否则直接报错拒绝出副本。节点 O(P+E)、边 O(PE)，二百人规模秒级完成，不枚举任何置换或配对。证书（公式、M、割容量、割边、复杂度、seed）随演练保存并在页面展示。
+
+**接口（前缀 `/api` 由 Nginx 代理，后端实际无该前缀）**
+
+| 方法与路径 | 权限 | 说明 |
+|---|---|---|
+| `POST /drills` | 分析师/负责人 | 受理并封存原册，body 含 `name`、`idempotency_key`，返回 `created` 与任务 |
+| `GET /drills` | 登录用户 | 演练列表（不含快照大字段） |
+| `GET /drills/{id}` | 登录用户 | 演练详情、最优性证书与对账 |
+| `POST /drills/{id}/start` | 分析师/负责人 | 发起换号副本构造（已开放则幂等返回） |
+| `POST /drills/{id}/retry` | 分析师/负责人 | 中断后沿封存版本恢复，不新增副本 |
+| `GET /drills/{id}/overlap` | 登录用户（仅 open） | 逐行重合数核对，含最小值与证书 |
+| `GET /drills/{id}/research-copy?limit=` | 登录用户（仅 open） | 整批开放的匿名研究副本 |
+
+状态机：`sealed`（已封存）→ `building`（构造中）→ `open`（已对账开放）；失败落 `failed`（中断待恢复），重试不改变受理号。
+
 
 ## 演示数据与一天剧本
 
@@ -87,7 +125,9 @@ Exhibition / VisitorRating / RecommendationRun / CuratorSelection 是核心实�
 
 ```text
 frontend/src/api, stores, types, components/common, hooks, pages, router, utils, constants
+  迁展演练：api/drills.js、stores/drill.js、pages/drill.js
 backend/src/routes, controllers, services, models, schemas, middlewares, utils, constants, config
+  迁展演练：routes/drills.py、controllers/drills.py、services/drills.py、services/drill_core.py、models/drill.py、schemas/drill.py
 backend/scripts/seed_demo.py
 backend/migrations/001_initial.sql
 ```
